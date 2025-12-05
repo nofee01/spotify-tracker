@@ -1,54 +1,45 @@
-# main.py
+from flask import Flask, redirect, request, render_template, jsonify
+import requests
 import os
 import base64
+from dotenv import load_dotenv
 import sqlite3
+from datetime import datetime
 import threading
 import time
-import logging
 from collections import Counter
-from datetime import datetime
-from dotenv import load_dotenv
-from flask import Flask, redirect, request, render_template, jsonify
-
-import requests
 
 load_dotenv()
 
-# --- Logging ---------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("spotify-tracker")
-
-# --- Flask setup ----------------------------------------------------------
 app = Flask(__name__)
 
-# --- Config / env --------------------------------------------------------
-CLIENT_ID = os.environ.get("CLIENT_ID")
-CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
-REDIRECT_URI = os.environ.get("REDIRECT_URI")  # e.g. https://yourapp.onrender.com/callback
+# Spotify credentials
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+REDIRECT_URI = os.getenv("REDIRECT_URI")
 SCOPE = "user-read-currently-playing user-read-playback-state"
 
-# --- Globals --------------------------------------------------------------
+# Thread starter flag
+thread_started = False
+
+# Globals
 access_token = None
 refresh_token = None
 token_expires_at = None
-
-# Use absolute DB path so it works on Render
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "spotify_tracks.db")
-
-# Current live tracking state (kept in memory)
+DB_PATH = "spotify_tracks.db"
 current_track_id = None
 current_start_time = None
-current_track_duration = 180  # seconds (fallback)
+current_track_duration = 180
 
-# Poll interval in seconds
-POLL_INTERVAL = 5
 
-# ---------- Database init -------------------------------------------------
+# ------------------------------------------------------
+# DATABASE
+# ------------------------------------------------------
 def init_db():
+    print(f"DB initialized at {os.path.abspath(DB_PATH)}")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''
+    c.execute("""
         CREATE TABLE IF NOT EXISTS track_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             track_id TEXT,
@@ -59,14 +50,17 @@ def init_db():
             start_time DATETIME,
             end_time DATETIME
         )
-    ''')
+    """)
     conn.commit()
     conn.close()
-    log.info("DB initialized at %s", DB_PATH)
+
 
 init_db()
 
-# ---------- Spotify Auth helpers ------------------------------------------
+
+# ------------------------------------------------------
+# AUTH URL
+# ------------------------------------------------------
 def get_auth_url():
     return (
         "https://accounts.spotify.com/authorize"
@@ -76,9 +70,17 @@ def get_auth_url():
         f"&scope={SCOPE}"
     )
 
-def exchange_code_for_token(code):
-    """Exchange authorization code for access + refresh tokens."""
+
+@app.route("/")
+def login():
+    return redirect(get_auth_url())
+
+
+@app.route("/callback")
+def callback():
     global access_token, refresh_token, token_expires_at
+
+    code = request.args.get("code")
     auth_string = f"{CLIENT_ID}:{CLIENT_SECRET}"
     b64_auth = base64.b64encode(auth_string.encode()).decode()
 
@@ -90,236 +92,151 @@ def exchange_code_for_token(code):
         "redirect_uri": REDIRECT_URI
     }
 
-    r = requests.post(token_url, headers=headers, data=data, timeout=10)
-    if r.status_code != 200:
-        log.error("Token exchange failed: %s %s", r.status_code, r.text)
-        return False
+    res = requests.post(token_url, headers=headers, data=data)
+    tokens = res.json()
 
-    tokens = r.json()
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token")
     expires_in = tokens.get("expires_in", 3600)
-    token_expires_at = datetime.now().timestamp() + int(expires_in) - 60
-    log.info("Obtained access token (expires in %s s).", expires_in)
-    return True
+    token_expires_at = datetime.now().timestamp() + expires_in - 60
 
+    return redirect("/dashboard")
+
+
+# ------------------------------------------------------
+# REFRESH ACCESS TOKEN
+# ------------------------------------------------------
 def refresh_access_token():
-    """Use refresh token to obtain a new access token."""
-    global access_token, token_expires_at, refresh_token
-    if not refresh_token:
-        log.warning("No refresh token available to refresh access token.")
-        return False
-
+    global access_token, refresh_token, token_expires_at
     auth_string = f"{CLIENT_ID}:{CLIENT_SECRET}"
     b64_auth = base64.b64encode(auth_string.encode()).decode()
-    token_url = "https://accounts.spotify.com/api/token"
+
+    url = "https://accounts.spotify.com/api/token"
     headers = {"Authorization": f"Basic {b64_auth}"}
     data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
 
     try:
-        r = requests.post(token_url, headers=headers, data=data, timeout=10)
-        if r.status_code != 200:
-            log.error("Refresh token failed: %s %s", r.status_code, r.text)
-            return False
-        tokens = r.json()
+        res = requests.post(url, headers=headers, data=data)
+        tokens = res.json()
+
         access_token = tokens.get("access_token")
         expires_in = tokens.get("expires_in", 3600)
-        token_expires_at = datetime.now().timestamp() + int(expires_in) - 60
-        log.info("Refreshed access token (expires in %s s).", expires_in)
-        return True
+        token_expires_at = datetime.now().timestamp() + expires_in - 60
+
+        print("Token refreshed")
+
     except Exception as e:
-        log.exception("Exception refreshing token: %s", e)
-        return False
+        print("Error refreshing:", e)
 
-# ---------- Background polling -------------------------------------------
+
+# ------------------------------------------------------
+# BACKGROUND TRACK POLLING
+# ------------------------------------------------------
 def background_track_polling():
-    """
-    Runs in a background thread. Polls Spotify's currently-playing endpoint
-    and logs play periods to SQLite. Designed to run continuously on Render.
-    """
-    global current_track_id, current_start_time, access_token, token_expires_at, current_track_duration
+    global current_track_id, current_start_time, current_track_duration
 
-    log.info("Background polling thread running (interval %s s)", POLL_INTERVAL)
+    print("Background thread started")
+
     while True:
         try:
-            # Refresh access token if near expiry
             if token_expires_at and datetime.now().timestamp() > token_expires_at:
-                refreshed = refresh_access_token()
-                if not refreshed:
-                    log.warning("Token refresh failed; will retry later.")
+                refresh_access_token()
 
-            if not access_token:
-                # nothing to do without an access token
-                time.sleep(POLL_INTERVAL)
-                continue
+            if access_token:
+                url = "https://api.spotify.com/v1/me/player/currently-playing"
+                headers = {"Authorization": f"Bearer {access_token}"}
+                res = requests.get(url, headers=headers, timeout=10)
 
-            url = "https://api.spotify.com/v1/me/player/currently-playing"
-            headers = {"Authorization": f"Bearer {access_token}"}
-            r = requests.get(url, headers=headers, timeout=10)
+                if res.status_code == 200:
+                    data = res.json()
 
-            # 204 = nothing playing, 200 = data, other = error
-            if r.status_code == 204:
-                # nothing playing; mark paused/stopped
-                if current_start_time is not None:
-                    # When we receive 204 we treat it as stop/pause: end current track
-                    now = datetime.now()
-                    try:
-                        conn = sqlite3.connect(DB_PATH)
-                        c = conn.cursor()
-                        c.execute('''
-                            UPDATE track_history
-                            SET end_time = ?
-                            WHERE track_id = ? AND end_time IS NULL
-                        ''', (now, current_track_id))
-                        conn.commit()
-                        conn.close()
-                        log.info("Marked end_time for track %s at %s (204)", current_track_id, now)
-                    except Exception:
-                        log.exception("Failed to update end_time on 204")
-                    current_start_time = None
-                current_track_duration = 180
-                time.sleep(POLL_INTERVAL)
-                continue
+                    if data.get("item") and data.get("is_playing"):
+                        track_id = data["item"]["id"]
+                        track_name = data["item"]["name"]
+                        artists = ", ".join([a["name"] for a in data["item"]["artists"]])
+                        album_name = data["item"]["album"]["name"]
+                        album_image = data["item"]["album"]["images"][0]["url"]
+                        duration_ms = data["item"]["duration_ms"]
+                        now = datetime.now()
 
-            if r.status_code != 200:
-                log.warning("currently-playing returned %s: %s", r.status_code, r.text)
-                time.sleep(POLL_INTERVAL)
-                continue
+                        current_track_duration = int(duration_ms / 1000)
 
-            data = r.json()
-            # defensive checks
-            item = data.get("item")
-            is_playing = data.get("is_playing", False)
-            if not item or not is_playing:
-                # If item missing or not playing: pause behavior
-                if current_start_time is not None:
-                    # End previous track if it was playing
-                    now = datetime.now()
-                    try:
-                        conn = sqlite3.connect(DB_PATH)
-                        c = conn.cursor()
-                        c.execute('''
-                            UPDATE track_history
-                            SET end_time = ?
-                            WHERE track_id = ? AND end_time IS NULL
-                        ''', (now, current_track_id))
-                        conn.commit()
-                        conn.close()
-                        log.info("Marked end_time for track %s at %s (paused/stopped)", current_track_id, now)
-                    except Exception:
-                        log.exception("Failed to update end_time on pause/stop")
-                    current_start_time = None
-                current_track_duration = 180
-                time.sleep(POLL_INTERVAL)
-                continue
+                        # New track
+                        if track_id != current_track_id:
+                            # Close previous track
+                            if current_track_id:
+                                conn = sqlite3.connect(DB_PATH)
+                                c = conn.cursor()
+                                c.execute("""
+                                    UPDATE track_history
+                                    SET end_time=?
+                                    WHERE track_id=? AND end_time IS NULL
+                                """, (now, current_track_id))
+                                conn.commit()
+                                conn.close()
 
-            # Extract useful info
-            track_id = item.get("id")
-            track_name = item.get("name", "Unknown")
-            artists = ", ".join([a.get("name", "") for a in item.get("artists", [])])
-            album = item.get("album", {})
-            album_name = album.get("name")
-            album_images = album.get("images") or []
-            album_image = album_images[0].get("url") if album_images else None
-            duration_ms = item.get("duration_ms", None)
-            now = datetime.now()
+                            # Insert new
+                            conn = sqlite3.connect(DB_PATH)
+                            c = conn.cursor()
+                            c.execute("""
+                                INSERT INTO track_history
+                                (track_id, track_name, artists, album_name, album_image, start_time)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            """, (track_id, track_name, artists, album_name, album_image, now))
+                            conn.commit()
+                            conn.close()
 
-            if duration_ms:
-                current_track_duration = int(duration_ms / 1000)
+                            current_track_id = track_id
+                            current_start_time = now
 
-            # If the track changed, close previous and insert new
-            if track_id != current_track_id:
-                # End previous
-                if current_track_id is not None:
-                    try:
-                        conn = sqlite3.connect(DB_PATH)
-                        c = conn.cursor()
-                        c.execute('''
-                            UPDATE track_history
-                            SET end_time = ?
-                            WHERE track_id = ? AND end_time IS NULL
-                        ''', (now, current_track_id))
-                        conn.commit()
-                        conn.close()
-                        log.info("Ended previous track %s at %s", current_track_id, now)
-                    except Exception:
-                        log.exception("Failed to end previous track on change")
+                        # Same track but resumed
+                        elif current_start_time is None:
+                            current_start_time = now
 
-                # Insert new track
-                try:
-                    conn = sqlite3.connect(DB_PATH)
-                    c = conn.cursor()
-                    c.execute('''
-                        INSERT INTO track_history
-                        (track_id, track_name, artists, album_name, album_image, start_time)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (track_id, track_name, artists, album_name, album_image, now))
-                    conn.commit()
-                    conn.close()
-                    log.info("Inserted new track %s - %s", track_id, track_name)
-                except Exception:
-                    log.exception("Failed to insert new track")
-
-                current_track_id = track_id
-                current_start_time = now
-
-            else:
-                # same track; if current_start_time was None (resumed), set it
-                if current_start_time is None:
-                    current_start_time = now
-                    log.info("Resumed tracking for track %s at %s", current_track_id, now)
+                    else:
+                        current_start_time = None
+                        current_track_duration = 180
 
         except Exception as e:
-            log.exception("Background polling error: %s", e)
+            print("Polling error:", e)
 
-        time.sleep(POLL_INTERVAL)
+        time.sleep(5)
 
-# We will start this in before_first_request to be safe with Gunicorn
-_background_thread_started = False
 
-@app.before_first_request
-def start_background_thread():
-    global _background_thread_started
-    if _background_thread_started:
-        return
-    thread = threading.Thread(target=background_track_polling)
-    thread.daemon = True
-    thread.start()
-    _background_thread_started = True
-    log.info("Background polling thread started via before_first_request")
+# ------------------------------------------------------
+# GET USER PROFILE
+# ------------------------------------------------------
+def get_user_profile():
+    if not access_token:
+        return None
+    try:
+        url = "https://api.spotify.com/v1/me"
+        headers = {"Authorization": f"Bearer {access_token}"}
+        r = requests.get(url, headers=headers)
+        if r.status_code == 200:
+            data = r.json()
+            return {
+                "display_name": data.get("display_name", "Spotify User"),
+                "profile_image": data.get("images")[0]["url"] if data.get("images") else None
+            }
+    except:
+        pass
+    return None
 
-# ---------- Routes --------------------------------------------------------
-@app.route("/")
-def login():
-    # redirect user to Spotify consent screen
-    if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
-        msg = "Missing CLIENT_ID/CLIENT_SECRET/REDIRECT_URI environment variables"
-        log.error(msg)
-        return msg, 500
-    return redirect(get_auth_url())
 
-@app.route("/callback")
-def callback():
-    code = request.args.get("code")
-    error = request.args.get("error")
-    if error:
-        log.error("Spotify callback returned error: %s", error)
-        return f"Spotify returned error: {error}", 400
-    if not code:
-        log.error("No code parameter in callback")
-        return "Missing code in callback", 400
-
-    ok = exchange_code_for_token(code)
-    if not ok:
-        return "Failed to exchange code for token. Check logs.", 500
-
-    # Helpful logging for debugging (won't leak to users but in server logs)
-    log.info("Access token and refresh token obtained. Redirecting to dashboard.")
-    return redirect("/dashboard")
-
+# ------------------------------------------------------
+# DASHBOARD
+# ------------------------------------------------------
 @app.route("/dashboard")
 def dashboard():
-    # total minutes across all finished plays
+    global thread_started
+
+    # Start background thread once
+    if not thread_started:
+        threading.Thread(target=background_track_polling, daemon=True).start()
+        thread_started = True
+
+    # total minutes
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT start_time, end_time FROM track_history")
@@ -327,15 +244,12 @@ def dashboard():
     conn.close()
 
     total_seconds = 0
-    for row in rows:
-        try:
-            start_time = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S.%f")
-            end_time = datetime.strptime(row[1], "%Y-%m-%d %H:%M:%S.%f") if row[1] else None
-            if end_time:
-                total_seconds += int((end_time - start_time).total_seconds())
-        except Exception:
-            # skip malformed rows
-            continue
+    for start, end in rows:
+        start = datetime.strptime(start, "%Y-%m-%d %H:%M:%S.%f")
+        if end:
+            end = datetime.strptime(end, "%Y-%m-%d %H:%M:%S.%f")
+            total_seconds += int((end - start).total_seconds())
+
     total_minutes = total_seconds // 60
 
     # top artists
@@ -344,12 +258,11 @@ def dashboard():
     c.execute("SELECT artists FROM track_history")
     artist_rows = c.fetchall()
     conn.close()
+
     artist_counter = Counter()
     for row in artist_rows:
-        if not row or not row[0]:
-            continue
-        artists = [a.strip() for a in row[0].split(",") if a.strip()]
-        artist_counter.update(artists)
+        artist_counter.update([a.strip() for a in row[0].split(",")])
+
     top_artists = artist_counter.most_common(10)
 
     # top tracks
@@ -358,57 +271,61 @@ def dashboard():
     c.execute("SELECT track_name, artists, album_image FROM track_history")
     track_rows = c.fetchall()
     conn.close()
+
     track_counter = Counter()
     track_info = {}
-    for row in track_rows:
-        if not row:
-            continue
-        key = (row[0], row[1])
+
+    for name, artists, img in track_rows:
+        key = (name, artists)
         track_counter[key] += 1
-        track_info[key] = row[2]
-    top_tracks_list = []
-    for (track_name, artists), count in track_counter.most_common(50):
-        top_tracks_list.append({
-            "track_name": track_name,
+        track_info[key] = img
+
+    top_tracks = [
+        {
+            "track_name": name,
             "artists": artists,
             "count": count,
-            "album_image": track_info.get((track_name, artists))
-        })
+            "album_image": track_info[(name, artists)]
+        }
+        for (name, artists), count in track_counter.most_common(50)
+    ]
 
     user_profile = get_user_profile()
 
     return render_template("dashboard.html",
                            total_minutes=total_minutes,
                            top_artists=top_artists,
-                           top_tracks=top_tracks_list,
+                           top_tracks=top_tracks,
                            user_profile=user_profile)
 
+
+# ------------------------------------------------------
+# CURRENT TRACK
+# ------------------------------------------------------
 @app.route("/current-track")
 def current_track():
-    global current_track_id, current_start_time, current_track_duration
-    # If not authenticated
     if not access_token:
-        return jsonify({"error": "User not authenticated"}), 401
+        return jsonify({"error": "Not logged in"}), 401
 
-    # If no track playing
     if not current_track_id or not current_start_time:
-        return jsonify({"message": "No track currently playing"}), 200
+        return jsonify({"message": "No track currently playing"})
 
     now = datetime.now()
     seconds_played = int((now - current_start_time).total_seconds())
 
-    # fetch last known metadata from DB (fallback)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        "SELECT track_name, artists, album_name, album_image FROM track_history "
-        "WHERE track_id=? ORDER BY start_time DESC LIMIT 1", (current_track_id,)
-    )
+    c.execute("""
+        SELECT track_name, artists, album_name, album_image
+        FROM track_history
+        WHERE track_id=?
+        ORDER BY start_time DESC LIMIT 1
+    """, (current_track_id,))
     row = c.fetchone()
     conn.close()
 
     if not row:
-        return jsonify({"message": "Track info not found"}), 200
+        return jsonify({"message": "Track not found"})
 
     return jsonify({
         "track_name": row[0],
@@ -419,28 +336,9 @@ def current_track():
         "duration": current_track_duration
     })
 
-# ---------- User profile helper ------------------------------------------
-def get_user_profile():
-    if not access_token:
-        return None
-    try:
-        url = "https://api.spotify.com/v1/me"
-        headers = {"Authorization": f"Bearer {access_token}"}
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            return {
-                "display_name": data.get("display_name", "Spotify User"),
-                "profile_image": data.get("images")[0]["url"] if data.get("images") else None
-            }
-        else:
-            log.warning("Failed to fetch user profile: %s %s", res.status_code, res.text)
-    except Exception:
-        log.exception("Exception while fetching user profile")
-    return None
 
-# ---------- Local dev helper ----------------------------------------------
+# ------------------------------------------------------
+# RUN
+# ------------------------------------------------------
 if __name__ == "__main__":
-    # For local testing only; on Render use Procfile + gunicorn
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", debug=True)
