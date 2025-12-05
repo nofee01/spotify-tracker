@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Spotify Track History</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; margin-top: 30px; }
+        table { margin: auto; border-collapse: collapse; width: 95%; }
+        th, td { border: 1px solid #ddd; padding: 8px; }
+        th { background-color: #1db954; color: white; }
+        img { width: 50px; }
+    </style>
+</head>
+<body>
+    <h1>Spotify Track History</h1>
+    <h3>Total minutes listened: {{ total_minutes }}</h3>
+    <table>
+        <tr>
+            <th>Album</th>
+            <th>Track</th>
+            <th>Artists</th>
+            <th>Start Time</th>
+            <th>End Time</th>
+            <th>Seconds Played</th>
+        </tr>
+        {% for track in history %}
+        <tr>
+            <td><img src="{{ track.album_image }}" alt="Album Art"></td>
+            <td>{{ track.track_name }}</td>
+            <td>{{ track.artists }}</td>
+            <td>{{ track.start_time }}</td>
+            <td>{{ track.end_time if track.end_time else "Playing" }}</td>
+            <td>{{ track.seconds_played if track.seconds_played else "…" }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+</body>
+</html>
