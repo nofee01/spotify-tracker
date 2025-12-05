@@ -14,9 +14,11 @@ load_dotenv()
 app = Flask(__name__)
 
 # Spotify credentials
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI")
+
+CLIENT_ID = os.environ.get("CLIENT_ID")
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
+REDIRECT_URI = os.environ.get("REDIRECT_URI")
+
 SCOPE = "user-read-currently-playing user-read-playback-state"
 
 # Global variables
@@ -289,3 +291,4 @@ def current_track():
 # ---------- Run app ----------
 if __name__ == "__main__":
     app.run(debug=True)
+
